@@ -135,9 +135,6 @@ class TelegramChannel(BaseChannel):
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
         self._seen_messages: dict[str, float] = {}  # chat_id:message_id -> monotonic timestamp
         self._seen_ttl_seconds = 600
-        self._media_groups: dict[str, dict] = {}
-        self._media_group_tasks: dict[str, asyncio.Task] = {}
-        self._media_group_wait_seconds = 1.2
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -217,12 +214,6 @@ class TelegramChannel(BaseChannel):
         # Cancel all typing indicators
         for chat_id in list(self._typing_tasks):
             self._stop_typing(chat_id)
-
-        for task in self._media_group_tasks.values():
-            if not task.done():
-                task.cancel()
-        self._media_group_tasks.clear()
-        self._media_groups.clear()
 
         app = self._app
         if app:
@@ -369,32 +360,9 @@ class TelegramChannel(BaseChannel):
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
 
-        media_group_id = message.media_group_id
-        if media_group_id:
-            await self._collect_media_group_message(
-                message, user, sender_id, chat_id, media_group_id
-            )
-            return
-
-        content_parts, media_paths = await self._extract_message_content(message, chat_id)
-        await self._forward_inbound_message(
-            sender_id=sender_id,
-            chat_id=chat_id,
-            content_parts=content_parts,
-            media_paths=media_paths,
-            metadata={
-                "message_id": message.message_id,
-                "user_id": user.id,
-                "username": user.username,
-                "first_name": user.first_name,
-                "is_group": message.chat.type != "private",
-            },
-        )
-
-    async def _extract_message_content(self, message, chat_id: int) -> tuple[list[str], list[str]]:
-        """Extract text/media content and download media if needed."""
-        content_parts: list[str] = []
-        media_paths: list[str] = []
+        # Build content from text and/or media
+        content_parts = []
+        media_paths = []
 
         # Text content
         if message.text:
@@ -430,10 +398,16 @@ class TelegramChannel(BaseChannel):
                     original_name,
                 )
 
-                # Save to ~/.nanobot/media/telegram/<chat_id>/<date>/
+                # Save to workspace/media/telegram/<chat_id>/<date>/
                 date_part = datetime.now().strftime("%Y-%m-%d")
                 media_dir = (
-                    Path.home() / ".nanobot" / "media" / "telegram" / str(chat_id) / date_part
+                    Path.home()
+                    / ".nanobot"
+                    / "workspace"
+                    / "media"
+                    / "telegram"
+                    / str(chat_id)
+                    / date_part
                 )
                 media_dir.mkdir(parents=True, exist_ok=True)
 
@@ -468,97 +442,28 @@ class TelegramChannel(BaseChannel):
                 logger.error("Failed to download media: {}", e)
                 content_parts.append(f"[{media_type}: download failed]")
 
-        return content_parts, media_paths
-
-    async def _collect_media_group_message(
-        self,
-        message,
-        user,
-        sender_id: str,
-        chat_id: int,
-        media_group_id: str,
-    ) -> None:
-        """Collect messages in a Telegram media group and flush once."""
-        content_parts, media_paths = await self._extract_message_content(message, chat_id)
-        group_key = f"{chat_id}:{media_group_id}"
-
-        group = self._media_groups.get(group_key)
-        if group is None:
-            group = {
-                "sender_id": sender_id,
-                "chat_id": chat_id,
-                "content_parts": [],
-                "media_paths": [],
-                "message_ids": [],
-                "user_id": user.id,
-                "username": user.username,
-                "first_name": user.first_name,
-                "is_group": message.chat.type != "private",
-                "media_group_id": media_group_id,
-            }
-            self._media_groups[group_key] = group
-
-        group["content_parts"].extend(content_parts)
-        group["media_paths"].extend(media_paths)
-        group["message_ids"].append(message.message_id)
-
-        task = self._media_group_tasks.get(group_key)
-        if task and not task.done():
-            task.cancel()
-        self._media_group_tasks[group_key] = asyncio.create_task(
-            self._flush_media_group_after_delay(group_key)
-        )
-
-    async def _flush_media_group_after_delay(self, group_key: str) -> None:
-        """Flush a media group after a short debounce delay."""
-        try:
-            await asyncio.sleep(self._media_group_wait_seconds)
-        except asyncio.CancelledError:
-            return
-
-        group = self._media_groups.pop(group_key, None)
-        self._media_group_tasks.pop(group_key, None)
-        if not group:
-            return
-
-        message_ids = group["message_ids"]
-        await self._forward_inbound_message(
-            sender_id=group["sender_id"],
-            chat_id=group["chat_id"],
-            content_parts=group["content_parts"],
-            media_paths=group["media_paths"],
-            metadata={
-                "message_id": min(message_ids),
-                "message_ids": message_ids,
-                "user_id": group["user_id"],
-                "username": group["username"],
-                "first_name": group["first_name"],
-                "is_group": group["is_group"],
-                "media_group_id": group["media_group_id"],
-            },
-        )
-
-    async def _forward_inbound_message(
-        self,
-        sender_id: str,
-        chat_id: int,
-        content_parts: list[str],
-        media_paths: list[str],
-        metadata: dict,
-    ) -> None:
-        """Forward normalized inbound message to the bus."""
         content = "\n".join(content_parts) if content_parts else "[empty message]"
+
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
 
         str_chat_id = str(chat_id)
+
+        # Start typing indicator before processing
         self._start_typing(str_chat_id)
 
+        # Forward to the message bus
         await self._handle_message(
             sender_id=sender_id,
             chat_id=str_chat_id,
             content=content,
             media=media_paths,
-            metadata=metadata,
+            metadata={
+                "message_id": message.message_id,
+                "user_id": user.id,
+                "username": user.username,
+                "first_name": user.first_name,
+                "is_group": message.chat.type != "private",
+            },
         )
 
     def _start_typing(self, chat_id: str) -> None:
